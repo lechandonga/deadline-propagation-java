@@ -53,12 +53,83 @@ request finished budget-ledger[fanout=213ms terminated=DEADLINE_EXCEEDED workSto
 
 台账只记录阶段名与时长，**不包含请求体或任何敏感请求内容**。
 
+## 预算内重试
+
+重试能力（`retry` 包，入口 `RetryingFanOut`）建立在同一个收缩预算之上，
+**永远不会因为重试拉长整体时间**：
+
+- **只重试没确认完成的工作**：一次尝试成功返回才算“确认完成”，其副作用已落地，
+  这类条目被记入 `completed`，无论后续发生什么都不会再执行第二遍；只有
+  `unfinished`（超时 / 失败 / 取消 / 被拒）的条目允许重试。
+- **次数上限 + 间隔**：每个条目的尝试总次数（含首次）受
+  `max-attempts` 限制，两次尝试之间至少等待 `backoff`；退避等待本身也挂在
+  预算上，预算一终止（到期或取消）等待立即结束，**超时之后不会冒出新预算**。
+- **启动成本阈值**：每次尝试前检查 `remaining`，剩余时间低于
+  `retry-threshold` 时直接放弃重试（`REMAINING_BELOW_THRESHOLD`），
+  不启动注定失败的尝试。
+- **取消 / 断连后零重试**：预算终止原因为 `CLIENT_CANCELLED` / `CANCELLED`
+  后，无论是在尝试中还是退避等待中，都不会再发起任何尝试。
+- **默认关闭，完全兼容**：默认 `max-attempts=1`，未配置的入口行为与以前
+  完全一致（例如 `/api/sync` 超预算仍然是 500）。
+
+## 降级结果
+
+重试也救不回来时，请求**不再整体失败**，而是返回一份三态可区分的
+`DegradedResult`：
+
+| state | 含义 |
+| --- | --- |
+| `ALL_SUCCESS` | 全部条目确认完成，`stopReason=NONE` |
+| `PARTIAL_SUCCESS` | 有确认完成的条目、也有未完成条目（降级返回，HTTP 仍为 200） |
+| `FAILED` | 没有任何条目确认完成 |
+
+结果中 `completed` 列出**已确认完成、绝不能再重试**的条目，`unfinished`
+列出未确认完成的条目；`items` 给出每条的最终状态（`SUCCESS / TIMEOUT /
+FAILED / CANCELLED / REJECTED`）、实际尝试次数与停止原因。聚合停止原因
+`stopReason` 由条目集合按固定优先级得出（取消 > 预算耗尽 > 低于阈值 >
+并发受限 > 次数用尽 > 内部错误），**与谁先跑完无关**，同样的输入必然得到
+同样的降级结论。停止原因区分 `BUDGET_EXHAUSTED`、`CLIENT_CANCELLED` /
+`CANCELLED`、`INTERNAL_ERROR` 等。
+
+**流式路径**（`/api/stream-retry`）语义一致：一个 tick 在字节真正写出
+（确认点）之前失败可以重试，已写出的字节**绝不重复、也不会凭空多出**；
+整个流以且仅以一个终止标记收尾：`END:COMPLETE`（全部完成）、
+`END:BUDGET_EXHAUSTED`、`END:CLIENT_CANCELLED` 等，终止后不再写任何字节。
+
+## 下游保护：入口并发上限
+
+每个入口可配置同时“真正在跑 / 在重试”的尝试数上限 `max-concurrency`
+（`0` 或负数表示不限）。许可只在尝试执行期间持有，退避等待期间释放。
+到达上限时**不排队硬塞**：条目不执行、`attempts=0`、状态 `REJECTED`、
+停止原因 `CONCURRENCY_LIMITED`，直接进入降级结果。
+
 ## 配置项
+
+全局默认（未配置的入口沿用，默认行为与旧版本一致）：
 
 | 配置 | 默认 | 说明 |
 | --- | --- | --- |
 | `request.budget.default-budget` | `5s` | 每个入口请求获得整体时间预算 |
 | `request.budget.termination-grace` | `500ms` | 终止后等待在途工作停止的宽限期（预留给关闭策略） |
+| `request.budget.default-max-attempts` | `1` | 每个条目的尝试总次数（含首次）；`1` 表示不重试 |
+| `request.budget.default-retry-backoff` | `100ms` | 两次尝试之间的最小间隔 |
+| `request.budget.default-retry-threshold` | `50ms` | 剩余预算低于该值则不再发起尝试 |
+| `request.budget.max-concurrency` | `0`（不限） | 默认的入口在跑尝试数上限 |
+
+按入口覆盖（key 为请求 URI 路径，任何一项不写就继承默认值）：
+
+| 配置 | 说明 |
+| --- | --- |
+| `request.budget.entrypoints[/path].budget` | 该入口总预算 |
+| `request.budget.entrypoints[/path].max-attempts` | 该入口尝试次数上限 |
+| `request.budget.entrypoints[/path].backoff` | 该入口重试间隔 |
+| `request.budget.entrypoints[/path].retry-threshold` | 该入口的启动成本阈值 |
+| `request.budget.entrypoints[/path].max-concurrency` | 该入口并发在跑尝试上限 |
+
+配置在应用启动时（`@PostConstruct`）强校验：预算必须为正、次数 ≥ 1、
+间隔不能为负且必须小于预算等；写错会**直接启动失败并给出明确报错**，
+不会悄悄退回默认值。单个请求在进入时对配置拍一次不可变快照
+（`EntrypointSettings`），运行中改动配置不会影响在途请求。
 
 ## 代码结构
 
@@ -68,6 +139,11 @@ request finished budget-ledger[fanout=213ms terminated=DEADLINE_EXCEEDED workSto
 | `budget/BudgetContext` | 线程上下文传播与作用域还原（请求间隔离） |
 | `exec/BudgetAwareExecutor` | 跨线程传播、拒绝排队、取消中断在途任务、在途计数 |
 | `exec/FanOut` | 部分成功/超时/失败的确定性聚合与重试范围界定 |
+| `retry/RetryingFanOut` | 预算内自动重试（次数/间隔/阈值）、取消即停、降级聚合 |
+| `retry/DegradedResult` / `ItemResult` / `StopReason` | 三态降级结果与确定性停止原因 |
+| `retry/RetryPolicy` / `EntrypointSettings` / `EntrypointResolver` | 按入口的不可变配置快照解析 |
+| `retry/RetryScheduler` | 预算可中断的退避等待（到期/取消立即放行，不再重试） |
+| `retry/ConcurrencyLimiter` | 入口级并发上限：到顶即降级、绝不排队 |
 | `web/BudgetWebFilter` | 每请求预算分配、异步收尾、台账终结 |
 | `observability/BudgetLedger` | 预算流水与终止依据记录（不含敏感内容） |
 
@@ -77,6 +153,14 @@ request finished budget-ledger[fanout=213ms terminated=DEADLINE_EXCEEDED workSto
 - `GET /api/fanout?workMs=50` — 三个并发子任务（快/慢/失败），返回确定性的
   `outcomes`、`completed` 与 `retryable`。
 - `GET /api/stream` — 流式输出，预算耗尽或客户端断开后确定性停止。
+- `GET /api/retry/fanout?workMs=80` — 预算内重试 + 降级：`fast` 一次成功，
+  `flaky` 首次失败、重试成功，`slow` 在 400ms 预算内无法完成；返回三态
+  `state`、`completed` / `unfinished`、每条 `attempts` 与 `stopReason`。
+  该入口配置了 `max-concurrency=2`，并发受限时 `slow` 也可能直接
+  `REJECTED / CONCURRENCY_LIMITED`。
+- `GET /api/stream-retry?flakyTick=1&workMs=40` — 流式重试：指定 tick 首次
+  失败、在确认写出前重试，每个 tick 恰好出现一次，末尾恰好一个
+  `END:COMPLETE` 标记。
 
 ## 测试
 
@@ -89,5 +173,37 @@ request finished budget-ledger[fanout=213ms terminated=DEADLINE_EXCEEDED workSto
 - `BudgetWebFilterTest` — 每请求独立预算、线程还原、失败路径记为 `ERROR`。
 - `BudgetFlowIntegrationTest` — 端到端：超预算同步请求被拒绝、扇出部分完成、
   流式在截止时间确定停止、并发请求预算相互隔离。
+- `RetryingFanOutTest` — 重试成功且已完成工作不重跑、次数上限、取消后零重试、
+  到期停止、剩余时间低于阈值不启动、并发上限即降级、同输入同结论。
+- `DegradedResultTest` — 三态可区分、完成/未完成互斥、停止原因聚合与顺序无关。
+- `EntrypointResolverTest` — 按入口隔离、部分覆盖继承默认、快照不受运行中
+  改动影响、非法配置明确报错。
+- `RetryFlowIntegrationTest` / `RetryBudgetFlowIntegrationTest` — 端到端：
+  部分成功降级返回（预算耗尽路径与并发受限路径）、流式字节不重复不多写且
+  只有一个终止标记、未配置入口保持旧的失败行为。
+
+测试不依赖外部服务或真实网络，超时用例使用虚拟时钟或极短预算，可稳定快速跑完。
 
 运行：`mvn test`
+
+### 本地手工验证
+
+启动应用（`mvn spring-boot:run`）后：
+
+**复现“部分成功降级”**（重试成功 + 预算耗尽，绕开并发上限）：
+
+```bash
+# 临时把该入口并发放开，或直接观察默认配置下 slow 的降级原因
+curl -s "http://localhost:8080/api/retry/fanout?workMs=80"
+# "state":"PARTIAL_SUCCESS"，completed 含 fast/flaky，unfinished=["slow"]，
+# stopReason 为 BUDGET_EXHAUSTED 或 CONCURRENCY_LIMITED，HTTP 200
+```
+
+**复现“预算不够、放弃重试”**：剩余时间低于 `retry-threshold` 时，条目不启动
+新尝试，直接以 `REMAINING_BELOW_THRESHOLD` 降级；流式路径则在做不完下一个
+tick 时收尾：
+
+```bash
+curl -s "http://localhost:8080/api/stream-retry?flakyTick=0&workMs=200"
+# 每个已发 tick 只出现一次，末尾恰好一行 END:BUDGET_EXHAUSTED
+```

@@ -15,6 +15,8 @@ public enum TerminationReason {
     CANCELLED,
     /** Work was rejected because no budget remained; it never ran. */
     REJECTED_BUDGET_EXHAUSTED,
+    /** Work was rejected (not queued) because the entrypoint concurrency limit was reached. */
+    REJECTED_CONCURRENCY_LIMIT,
     /** Work failed with an internal error. */
     ERROR
 }

@@ -1,6 +1,9 @@
 package com.github.lechandonga.deadlinepropagationjava.web;
 
 import com.github.lechandonga.deadlinepropagationjava.exec.BudgetAwareExecutor;
+import com.github.lechandonga.deadlinepropagationjava.retry.EntrypointResolver;
+import com.github.lechandonga.deadlinepropagationjava.retry.RetryScheduler;
+import com.github.lechandonga.deadlinepropagationjava.retry.RetryingFanOut;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.context.annotation.Bean;
@@ -30,5 +33,20 @@ public class WebConfig {
             thread.setDaemon(true);
             return thread;
         }));
+    }
+
+    @Bean
+    public EntrypointResolver entrypointResolver(BudgetProperties properties) {
+        return new EntrypointResolver(properties);
+    }
+
+    @Bean
+    public RetryScheduler retryScheduler() {
+        return RetryScheduler.scheduled();
+    }
+
+    @Bean
+    public RetryingFanOut retryingFanOut(BudgetAwareExecutor executor, RetryScheduler scheduler) {
+        return new RetryingFanOut(executor, scheduler);
     }
 }

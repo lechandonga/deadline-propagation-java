@@ -4,6 +4,8 @@ import com.github.lechandonga.deadlinepropagationjava.budget.BudgetContext;
 import com.github.lechandonga.deadlinepropagationjava.budget.RequestBudget;
 import com.github.lechandonga.deadlinepropagationjava.budget.TerminationReason;
 import com.github.lechandonga.deadlinepropagationjava.observability.BudgetLedger;
+import com.github.lechandonga.deadlinepropagationjava.retry.EntrypointResolver;
+import com.github.lechandonga.deadlinepropagationjava.retry.EntrypointSettings;
 import jakarta.servlet.AsyncEvent;
 import jakarta.servlet.AsyncListener;
 import jakarta.servlet.FilterChain;
@@ -26,19 +28,28 @@ public class BudgetWebFilter extends OncePerRequestFilter {
 
     public static final String BUDGET_ATTR = BudgetWebFilter.class.getName() + ".BUDGET";
     public static final String LEDGER_ATTR = BudgetWebFilter.class.getName() + ".LEDGER";
+    public static final String SETTINGS_ATTR = BudgetWebFilter.class.getName() + ".SETTINGS";
 
     private static final Logger log = LoggerFactory.getLogger(BudgetWebFilter.class);
 
-    private final BudgetProperties properties;
+    private final EntrypointResolver resolver;
 
     public BudgetWebFilter(BudgetProperties properties) {
-        this.properties = properties;
+        this(properties, new EntrypointResolver(properties));
+    }
+
+    public BudgetWebFilter(BudgetProperties properties, EntrypointResolver resolver) {
+        this.resolver = resolver;
     }
 
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
                                     FilterChain chain) throws ServletException, IOException {
-        RequestBudget budget = RequestBudget.newBudget(properties.getDefaultBudget());
+        // Snapshot per-entrypoint settings once: in-flight requests are never
+        // steered by runtime configuration changes.
+        EntrypointSettings settings = resolver.resolve(request.getRequestURI());
+        request.setAttribute(SETTINGS_ATTR, settings);
+        RequestBudget budget = RequestBudget.newBudget(settings.budget());
         BudgetLedger ledger = BudgetLedger.create();
         request.setAttribute(BUDGET_ATTR, budget);
         request.setAttribute(LEDGER_ATTR, ledger);
@@ -97,5 +108,10 @@ public class BudgetWebFilter extends OncePerRequestFilter {
 
     public static BudgetLedger currentLedger(HttpServletRequest request) {
         return (BudgetLedger) request.getAttribute(LEDGER_ATTR);
+    }
+
+    /** Immutable entrypoint settings snapshot bound to this request. */
+    public static EntrypointSettings currentSettings(HttpServletRequest request) {
+        return (EntrypointSettings) request.getAttribute(SETTINGS_ATTR);
     }
 }
