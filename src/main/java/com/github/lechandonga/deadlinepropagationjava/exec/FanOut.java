@@ -57,6 +57,10 @@ public final class FanOut {
             return new Outcome<>(name, Outcome.Status.TIMEOUT, null,
                     TerminationReason.DEADLINE_EXCEEDED, cause);
         }
+        if (cause instanceof ConcurrencyLimitRejectedException) {
+            return new Outcome<>(name, Outcome.Status.REJECTED, null,
+                    TerminationReason.REJECTED_CONCURRENCY_LIMIT, cause);
+        }
         if (cause instanceof RequestCancelledException cancelled) {
             return new Outcome<>(name, Outcome.Status.CANCELLED, null,
                     cancelled.reason(), cause);
@@ -76,8 +80,13 @@ public final class FanOut {
     }
 
     public record Outcome<T>(String name, Status status, T value, TerminationReason reason,
-                             Throwable error) {
-        public enum Status {SUCCESS, TIMEOUT, FAILED, CANCELLED}
+                             Throwable error, int attempts) {
+        public enum Status {SUCCESS, TIMEOUT, FAILED, CANCELLED, REJECTED}
+
+        public Outcome(String name, Status status, T value, TerminationReason reason,
+                       Throwable error) {
+            this(name, status, value, reason, error, 1);
+        }
     }
 
     /**
@@ -88,7 +97,10 @@ public final class FanOut {
     public record FanOutResult<T>(List<Outcome<T>> outcomes) {
         /** Tasks that did not confirm completion; only these may be retried. */
         public List<String> retryable() {
-            return namesWhere(s -> s != Outcome.Status.SUCCESS);
+            // REJECTED work never ran due to the concurrency cap and must
+            // degrade immediately rather than be retried or queued.
+            return namesWhere(s -> s != Outcome.Status.SUCCESS
+                    && s != Outcome.Status.REJECTED);
         }
 
         /** Tasks confirmed complete; retrying these would duplicate side effects. */

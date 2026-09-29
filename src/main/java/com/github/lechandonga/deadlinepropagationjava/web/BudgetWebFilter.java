@@ -26,22 +26,27 @@ public class BudgetWebFilter extends OncePerRequestFilter {
 
     public static final String BUDGET_ATTR = BudgetWebFilter.class.getName() + ".BUDGET";
     public static final String LEDGER_ATTR = BudgetWebFilter.class.getName() + ".LEDGER";
+    public static final String PLAN_ATTR = BudgetWebFilter.class.getName() + ".PLAN";
 
     private static final Logger log = LoggerFactory.getLogger(BudgetWebFilter.class);
 
-    private final BudgetProperties properties;
+    private final EntryPolicyResolver resolver;
 
     public BudgetWebFilter(BudgetProperties properties) {
-        this.properties = properties;
+        this.resolver = new EntryPolicyResolver(properties);
     }
 
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
                                     FilterChain chain) throws ServletException, IOException {
-        RequestBudget budget = RequestBudget.newBudget(properties.getDefaultBudget());
+        // Resolve once per request: the snapshot is constant for the whole
+        // request, so runtime config changes cannot skew a running request.
+        RequestPlan plan = resolver.resolve(request.getRequestURI());
+        RequestBudget budget = RequestBudget.newBudget(plan.budget());
         BudgetLedger ledger = BudgetLedger.create();
         request.setAttribute(BUDGET_ATTR, budget);
         request.setAttribute(LEDGER_ATTR, ledger);
+        request.setAttribute(PLAN_ATTR, plan);
 
         try (BudgetContext.Scope ignored = BudgetContext.enter(budget)) {
             chain.doFilter(request, response);
@@ -97,5 +102,10 @@ public class BudgetWebFilter extends OncePerRequestFilter {
 
     public static BudgetLedger currentLedger(HttpServletRequest request) {
         return (BudgetLedger) request.getAttribute(LEDGER_ATTR);
+    }
+
+    /** The immutable entry-policy snapshot bound to this request. */
+    public static RequestPlan currentPlan(HttpServletRequest request) {
+        return (RequestPlan) request.getAttribute(PLAN_ATTR);
     }
 }

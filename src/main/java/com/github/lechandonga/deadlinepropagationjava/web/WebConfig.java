@@ -1,6 +1,7 @@
 package com.github.lechandonga.deadlinepropagationjava.web;
 
 import com.github.lechandonga.deadlinepropagationjava.exec.BudgetAwareExecutor;
+import com.github.lechandonga.deadlinepropagationjava.retry.RetryingFanOut;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.context.annotation.Bean;
@@ -30,5 +31,11 @@ public class WebConfig {
             thread.setDaemon(true);
             return thread;
         }));
+    }
+
+    /** Bounded retry engine; retries spend only the request's shrinking budget. */
+    @Bean
+    public RetryingFanOut retryingFanOut() {
+        return RetryingFanOut.create();
     }
 }

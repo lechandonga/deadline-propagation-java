@@ -24,12 +24,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * {@link BudgetExhaustedException} / {@link RequestCancelledException} instead
  * of silently queuing.
  */
-public final class BudgetAwareExecutor implements Executor, AutoCloseable {
+public class BudgetAwareExecutor implements Executor, AutoCloseable {
 
     private final ExecutorService delegate;
     private final Set<TrackedTask<?>> inFlight = ConcurrentHashMap.newKeySet();
 
-    private BudgetAwareExecutor(ExecutorService delegate) {
+    protected BudgetAwareExecutor(ExecutorService delegate) {
         this.delegate = delegate;
     }
 

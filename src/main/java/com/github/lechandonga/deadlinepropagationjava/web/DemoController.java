@@ -4,9 +4,12 @@ import com.github.lechandonga.deadlinepropagationjava.budget.BudgetContext;
 import com.github.lechandonga.deadlinepropagationjava.budget.BudgetExhaustedException;
 import com.github.lechandonga.deadlinepropagationjava.budget.RequestBudget;
 import com.github.lechandonga.deadlinepropagationjava.budget.TerminationReason;
+import com.github.lechandonga.deadlinepropagationjava.degrade.DegradedResult;
 import com.github.lechandonga.deadlinepropagationjava.exec.BudgetAwareExecutor;
 import com.github.lechandonga.deadlinepropagationjava.exec.FanOut;
 import com.github.lechandonga.deadlinepropagationjava.observability.BudgetLedger;
+import com.github.lechandonga.deadlinepropagationjava.retry.RetryingFanOut;
+import com.github.lechandonga.deadlinepropagationjava.stream.BudgetedStreamEmitter;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -15,11 +18,10 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Demo endpoints exercising the sync, async fan-out and streaming paths.
@@ -30,9 +32,11 @@ import java.util.Map;
 public class DemoController {
 
     private final BudgetAwareExecutor executor;
+    private final RetryingFanOut retryingFanOut;
 
-    public DemoController(BudgetAwareExecutor executor) {
+    public DemoController(BudgetAwareExecutor executor, RetryingFanOut retryingFanOut) {
         this.executor = executor;
+        this.retryingFanOut = retryingFanOut;
     }
 
     /** Sync path: staged work with budget checks between stages. */
@@ -85,32 +89,110 @@ public class DemoController {
     /**
      * Streaming path: emits ticks until the budget expires or the client
      * disconnects. Termination is deterministic: once terminated, no further
-     * bytes are written and the ledger records why.
+     * bytes are written and exactly one terminator line closes the stream.
      */
     @GetMapping(path = "/api/stream", produces = MediaType.TEXT_PLAIN_VALUE)
     public StreamingResponseBody stream(HttpServletRequest request) {
         RequestBudget budget = BudgetContext.requireCurrent();
         BudgetLedger ledger = BudgetWebFilter.currentLedger(request);
         return outputStream -> {
+            BudgetedStreamEmitter emitter = new BudgetedStreamEmitter(outputStream, budget);
             try {
                 int tick = 0;
-                while (true) {
+                while (emitter.writeLine("tick " + tick++)) {
                     budget.checkAlive();
-                    outputStream.write(("tick " + tick++ + "\n").getBytes(StandardCharsets.UTF_8));
-                    outputStream.flush();
                     Thread.sleep(100);
                 }
+                // writeLine refused because the budget terminated: finish once.
+                emitter.finish(budget.terminationReason());
             } catch (BudgetExhaustedException | com.github.lechandonga.deadlinepropagationjava.budget.RequestCancelledException e) {
                 // Deterministic finish: stop writing, record the real reason.
+                emitter.finish(budget.terminationReason());
                 ledger.recordStage("stream-terminated", budget.consumed());
             } catch (IOException clientGone) {
-                budget.cancel(TerminationReason.CLIENT_CANCELLED);
+                emitter.finish(TerminationReason.CLIENT_CANCELLED);
                 ledger.recordStage("stream-client-cancelled", budget.consumed());
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
+                emitter.finish(budget.terminationReason());
                 ledger.recordStage("stream-interrupted", budget.consumed());
             }
         };
+    }
+
+    /**
+     * Retry + degrade path. Three named units: one confirms immediately, one
+     * fails until attempt N (then confirms, demonstrating that retries rescue
+     * unconfirmed work), one always fails (demonstrating the bounded cap and
+     * a meaningful partial result).
+     */
+    @GetMapping("/api/degrade")
+    public Map<String, Object> degrade(@RequestParam(defaultValue = "3") int succeedOnAttempt,
+                                       HttpServletRequest request) {
+        RequestBudget budget = BudgetContext.requireCurrent();
+        RequestPlan plan = BudgetWebFilter.currentPlan(request);
+        BudgetLedger ledger = BudgetWebFilter.currentLedger(request);
+
+        AtomicInteger flakyAttempts = new AtomicInteger();
+        List<FanOut.NamedTask<String>> tasks = List.of(
+                new FanOut.NamedTask<>("confirmed",
+                        () -> executor.submit(() -> "done", budget)),
+                new FanOut.NamedTask<>("flaky",
+                        () -> executor.submit(() -> {
+                            if (flakyAttempts.incrementAndGet() < succeedOnAttempt) {
+                                throw new IllegalStateException("transient failure");
+                            }
+                            return "recovered";
+                        }, budget)),
+                new FanOut.NamedTask<>("always-failing",
+                        () -> executor.submit(() -> {
+                            throw new IllegalStateException("permanent failure");
+                        }, budget)));
+
+        DegradedResult<String> result = retryingFanOut.execute(
+                tasks, budget, plan.retryPolicy(), plan.limiter());
+        ledger.recordStage("degrade", budget.consumed());
+
+        Map<String, Object> body = result.toResponseBody();
+        body.put("remainingMs", budget.remaining().toMillis());
+        return body;
+    }
+
+    /**
+     * Deadline-driven degrade path: a quick unit confirms while a heavy unit
+     * runs into the deadline. The remaining budget cannot cover the retry
+     * threshold, so no retry is forced and the request degrades with
+     * {@code INSUFFICIENT_REMAINING}.
+     */
+    @GetMapping("/api/deadline")
+    public Map<String, Object> deadline(@RequestParam(defaultValue = "220") long heavyMs,
+                                        @RequestParam(defaultValue = "false") boolean failFirst,
+                                        HttpServletRequest request) {
+        RequestBudget budget = BudgetContext.requireCurrent();
+        RequestPlan plan = BudgetWebFilter.currentPlan(request);
+        BudgetLedger ledger = BudgetWebFilter.currentLedger(request);
+
+        List<FanOut.NamedTask<String>> tasks = List.of(
+                new FanOut.NamedTask<>("quick",
+                        () -> executor.submit(() -> "done", budget)),
+                new FanOut.NamedTask<>("heavy",
+                        () -> executor.submit(() -> {
+                            if (failFirst) {
+                                // Fails fast on attempt 1; the retry gate then
+                                // observes too little remaining budget and
+                                // declines to force another attempt.
+                                throw new IllegalStateException("first attempt failed");
+                            }
+                            return sleepAndReturn(heavyMs, "heavy-done");
+                        }, budget)));
+
+        DegradedResult<String> result = retryingFanOut.execute(
+                tasks, budget, plan.retryPolicy(), plan.limiter());
+        ledger.recordStage("deadline-degrade", budget.consumed());
+
+        Map<String, Object> body = result.toResponseBody();
+        body.put("remainingMs", budget.remaining().toMillis());
+        return body;
     }
 
     private static String sleepAndReturn(long ms, String value) throws InterruptedException {
